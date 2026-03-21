@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .env
-data/
-runs/
+/data/
+/runs/
 *.pt
 .DS_Store
