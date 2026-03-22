@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from tqdm import tqdm
 import cv2
+import multiprocessing
 
 def load_fonts(font_dir):
     # Procura tanto .ttf quanto .otf
@@ -138,6 +139,95 @@ def screentone(img):
 
     return Image.fromarray(img_np).convert("RGB")
 
+def generate_class_images(args):
+    class_id, kanji, num_images_per_class, img_size, output_dir, train_split_ratio, fonts = args
+    
+    # Reinicia o gerador de números aleatórios para garantir variabilidade em cada processo paralelo
+    np.random.seed()
+    random.seed()
+    
+    generated = 0
+    for i in range(num_images_per_class):
+        # 1. Configuração Aleatória
+        font_path = random.choice(fonts)
+        
+        # Varia o tamanho da fonte entre 50% e 90% da imagem
+        font_size = random.randint(int(img_size * 0.5), int(img_size * 0.9))
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception as e:
+            continue
+        
+        # Fundo: Branco ou levemente amarelado (papel velho)
+        bg_color = (random.randint(230, 255), random.randint(230, 255), random.randint(230, 255))
+        img = Image.new("RGB", (img_size, img_size), bg_color)
+        draw = ImageDraw.Draw(img)
+        
+        # 2. Centralizar Texto
+        # getbbox retorna (left, top, right, bottom)
+        try:
+            bbox_text = font.getbbox(kanji)
+        except:
+            # Fallback para versões antigas do Pillow se der erro
+            bbox_text = draw.textbbox((0, 0), kanji, font=font)
+
+        if not bbox_text: 
+            continue 
+        
+        text_w = bbox_text[2] - bbox_text[0]
+        text_h = bbox_text[3] - bbox_text[1]
+        
+        # Posição central calculada
+        x = (img_size - text_w) / 2 - bbox_text[0]
+        y = (img_size - text_h) / 2 - bbox_text[1]
+        
+        # Deslocamento aleatório pequeno (Shift)
+        x += random.uniform(-20, 20)
+        y += random.uniform(-20, 20)
+        
+        # Cor do texto (Preto ou cinza escuro)
+        text_color = (random.randint(0, 50), random.randint(0, 50), random.randint(0, 50))
+        draw.text((x, y), kanji, font=font, fill=text_color)
+        
+        # 3. Augmentations e recuperação da Bounding Box exata
+        img, bbox_exact = apply_augmentations(img)
+        xmin, ymin, xmax, ymax = bbox_exact
+        
+        # 4. Cálculo do BBox no formato YOLO
+        img_w, img_h = img.size
+        width = xmax - xmin
+        height = ymax - ymin
+        center_x = xmin + (width / 2)
+        center_y = ymin + (height / 2)
+        
+        # Normaliza para 0 a 1
+        center_x /= img_w
+        center_y /= img_h
+        width /= img_w
+        height /= img_h
+        
+        # Garante limites
+        center_x = max(0.0, min(1.0, center_x))
+        center_y = max(0.0, min(1.0, center_y))
+        width = max(0.0, min(1.0, width))
+        height = max(0.0, min(1.0, height))
+        
+        # 5. Salvar em Train ou Val
+        split = "train" if random.random() < train_split_ratio else "val"
+        
+        filename_base = f"{class_id}_{str(i).zfill(5)}"
+        img_path = os.path.join(output_dir, "images", split, f"{filename_base}.jpg")
+        txt_path = os.path.join(output_dir, "labels", split, f"{filename_base}.txt")
+        
+        img.save(img_path)
+        
+        with open(txt_path, "w") as f:
+            f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+            
+        generated += 1
+        
+    return generated
+
 def create_synthetic_dataset(output_dir, num_images_per_class, kanji_list, train_split_ratio=0.8):
     font_dir = os.path.join("assets", "fonts")
     fonts = load_fonts(font_dir)
@@ -153,90 +243,21 @@ def create_synthetic_dataset(output_dir, num_images_per_class, kanji_list, train
     print(f"Gerando {num_images_per_class} imagens para {len(kanji_list)} classes...")
     print(f"Total de imagens esperadas: {len(kanji_list) * num_images_per_class}")
     
-    total_images = len(kanji_list) * num_images_per_class
+    # Preparar argumentos para o multiprocessamento
+    args_list = []
+    for class_id, kanji in enumerate(kanji_list):
+        args_list.append((
+            class_id, kanji, num_images_per_class, img_size, output_dir, train_split_ratio, fonts
+        ))
+        
+    # Usar todos os núcleos físicos disponíveis menos 1 (para o sistema)
+    num_cores = max(1, multiprocessing.cpu_count() - 1)
+    print(f"Iniciando processamento paralelo com {num_cores} núcleos (CPUs)...")
     
-    # Barra de progresso global
-    with tqdm(total=total_images, desc="Progresso") as pbar:
-        for class_id, kanji in enumerate(kanji_list):
-            for i in range(num_images_per_class):
-                # 1. Configuração Aleatória
-                font_path = random.choice(fonts)
-                
-                # Varia o tamanho da fonte entre 50% e 90% da imagem
-                font_size = random.randint(int(img_size * 0.5), int(img_size * 0.9))
-                try:
-                    font = ImageFont.truetype(font_path, font_size)
-                except Exception as e:
-                    print(f"Erro na fonte {font_path}: {e}")
-                    continue
-                
-                # Fundo: Branco ou levemente amarelado (papel velho)
-                bg_color = (random.randint(230, 255), random.randint(230, 255), random.randint(230, 255))
-                img = Image.new("RGB", (img_size, img_size), bg_color)
-                draw = ImageDraw.Draw(img)
-                
-                # 2. Centralizar Texto
-                # getbbox retorna (left, top, right, bottom)
-                try:
-                    bbox_text = font.getbbox(kanji)
-                except:
-                    # Fallback para versões antigas do Pillow se der erro
-                    bbox_text = draw.textbbox((0, 0), kanji, font=font)
-
-                if not bbox_text: 
-                    pbar.update(1)
-                    continue 
-                
-                text_w = bbox_text[2] - bbox_text[0]
-                text_h = bbox_text[3] - bbox_text[1]
-                
-                # Posição central calculada
-                x = (img_size - text_w) / 2 - bbox_text[0]
-                y = (img_size - text_h) / 2 - bbox_text[1]
-                
-                # Deslocamento aleatório pequeno (Shift)
-                x += random.uniform(-20, 20)
-                y += random.uniform(-20, 20)
-                
-                # Cor do texto (Preto ou cinza escuro)
-                text_color = (random.randint(0, 50), random.randint(0, 50), random.randint(0, 50))
-                draw.text((x, y), kanji, font=font, fill=text_color)
-                
-                # 3. Augmentations e recuperação da Bounding Box exata
-                img, bbox_exact = apply_augmentations(img)
-                xmin, ymin, xmax, ymax = bbox_exact
-                
-                # 4. Cálculo do BBox no formato YOLO
-                img_w, img_h = img.size
-                width = xmax - xmin
-                height = ymax - ymin
-                center_x = xmin + (width / 2)
-                center_y = ymin + (height / 2)
-                
-                # Normaliza para 0 a 1
-                center_x /= img_w
-                center_y /= img_h
-                width /= img_w
-                height /= img_h
-                
-                # Garante limites
-                center_x = max(0.0, min(1.0, center_x))
-                center_y = max(0.0, min(1.0, center_y))
-                width = max(0.0, min(1.0, width))
-                height = max(0.0, min(1.0, height))
-                
-                # 5. Salvar em Train ou Val
-                split = "train" if random.random() < train_split_ratio else "val"
-                
-                filename_base = f"{class_id}_{str(i).zfill(5)}"
-                img_path = os.path.join(output_dir, "images", split, f"{filename_base}.jpg")
-                txt_path = os.path.join(output_dir, "labels", split, f"{filename_base}.txt")
-                
-                img.save(img_path)
-                
-                with open(txt_path, "w") as f:
-                    f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
-                
+    # Barra de progresso baseada nas classes!
+    with multiprocessing.Pool(processes=num_cores) as pool:
+        with tqdm(total=len(kanji_list), desc="Progresso") as pbar:
+            for _ in pool.imap_unordered(generate_class_images, args_list):
                 pbar.update(1)
 
     # 6. Criar data.yaml automaticamente
